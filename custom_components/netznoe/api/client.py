@@ -15,6 +15,44 @@ from .errors import (
 
 logger = logging.getLogger(__name__)
 
+#: Series the portal returns alongside the plain consumption, for metering
+#: points that take part in an energy community. The names on the left are
+#: the stable identifiers this library exposes; the names on the right are
+#: the portal's own, which differ per endpoint (see ``YEAR_FIELD_ALIASES``).
+#:
+#: ``grid_leftover`` is absent on purpose: it is computed rather than read,
+#: see :func:`derive_series`.
+CONSUMPTION_SERIES = {
+    "metered": "meteredValues",
+    "self_coverage": "selfCoverageValues",
+    "joint_tenancy": "jointTenancyProportionValues",
+}
+
+#: ``ConsumptionRecord/Year`` renames the plain consumption series and drops
+#: several others. Only the differences are listed.
+YEAR_FIELD_ALIASES = {"meteredValues": "values"}
+
+
+def pick_aggregate(response: Any) -> Optional[Dict[str, Any]]:
+    """Return the aggregate row of a ConsumptionRecord response.
+
+    Every ``ConsumptionRecord`` endpoint answers with a *list*: one row with
+    ``ec_id`` null covering the metering point as a whole, plus one row per
+    energy community it belonged to on that date. Only the aggregate row
+    carries the real consumption — a community row's ``meteredValues`` is
+    exactly half of it and is not a physical quantity.
+
+    Returns None when the response carries no usable row.
+    """
+    if isinstance(response, dict):
+        return response
+    if not isinstance(response, list) or not response:
+        return None
+    for row in response:
+        if isinstance(row, dict) and row.get("ec_id") is None:
+            return row
+    return response[0] if isinstance(response[0], dict) else None
+
 
 class Smartmeter:
     """Netz NO Smartmeter client."""
@@ -211,24 +249,37 @@ class Smartmeter:
         if not meter_id:
             raise SmartmeterQueryError("No metering point ID available")
 
+        times, series = self.get_consumption_day_series(day, meter_id)
+        return (times, series.get("metered", []))
+
+    def get_consumption_day_series(
+        self, day: date, meter_id: Optional[str] = None
+    ) -> Tuple[List[str], Dict[str, List[Optional[float]]]]:
+        """Get a day's consumption together with its energy-community series.
+
+        Args:
+            day: Date to get consumption for
+            meter_id: Metering point ID (uses default if None)
+
+        Returns:
+            Tuple of (peak_demand_times, {series name: values}). Series that
+            the portal leaves empty are omitted, so a metering point without
+            an energy community yields ``metered`` only.
+        """
+        meter_id = meter_id or self._metering_point_id
+        if not meter_id:
+            raise SmartmeterQueryError("No metering point ID available")
+
         response = self._call_api(
             const.ENDPOINT_CONSUMPTION_DAY,
             query={"meterId": meter_id, "day": day.strftime(const.API_DATE_FORMAT)},
         )
         logger.debug("ConsumptionDay raw response: %s", response)
 
-        # API may return multiple entries for energy community users.
-        # We want the entry with ec_id == null (the base meter, not community allocations).
-        if isinstance(response, list) and len(response) > 0:
-            base_entries = [r for r in response if r.get("ec_id") is None]
-            response = base_entries[0] if base_entries else response[0]
-        elif isinstance(response, list):
-            return ([], [])
-
-        return (
-            response.get("peakDemandTimes", []),
-            response.get("meteredValues", []),
-        )
+        row = pick_aggregate(response)
+        if row is None:
+            return ([], {})
+        return (row.get("peakDemandTimes") or [], _extract_series(row))
 
     def get_consumption_month(
         self, year: int, month: int, meter_id: Optional[str] = None
@@ -247,23 +298,31 @@ class Smartmeter:
         if not meter_id:
             raise SmartmeterQueryError("No metering point ID available")
 
+        times, series = self.get_consumption_month_series(year, month, meter_id)
+        return (times, series.get("metered", []))
+
+    def get_consumption_month_series(
+        self, year: int, month: int, meter_id: Optional[str] = None
+    ) -> Tuple[List[str], Dict[str, List[Optional[float]]]]:
+        """Get a month's consumption together with its energy-community series.
+
+        Returns:
+            Tuple of (peak_demand_times, {series name: values}), one value per
+            day of the month, padded with None.
+        """
+        meter_id = meter_id or self._metering_point_id
+        if not meter_id:
+            raise SmartmeterQueryError("No metering point ID available")
+
         response = self._call_api(
             const.ENDPOINT_CONSUMPTION_MONTH,
             query={"meterId": meter_id, "year": year, "month": month},
         )
 
-        # API may return multiple entries for energy community users.
-        # We want the entry with ec_id == null (the base meter, not community allocations).
-        if isinstance(response, list) and len(response) > 0:
-            base_entries = [r for r in response if r.get("ec_id") is None]
-            response = base_entries[0] if base_entries else response[0]
-        elif isinstance(response, list):
-            return ([], [])
-
-        return (
-            response.get("peakDemandTimes", []),
-            response.get("meteredValues", []),
-        )
+        row = pick_aggregate(response)
+        if row is None:
+            return ([], {})
+        return (row.get("peakDemandTimes") or [], _extract_series(row))
 
     def get_consumption_year(
         self, year: int, meter_id: Optional[str] = None
@@ -286,15 +345,16 @@ class Smartmeter:
             query={"meterId": meter_id, "year": year},
         )
 
-        # API returns a list containing a dictionary - extract first element
-        if isinstance(response, list) and len(response) > 0:
-            response = response[0]
-        elif isinstance(response, list):
+        # Same list-of-rows shape as the other endpoints. This used to take
+        # response[0] blindly, which is only right as long as the aggregate
+        # happens to come first.
+        row = pick_aggregate(response)
+        if row is None:
             return ([], [])
 
         return (
-            response.get("peakDemandTimes", []),
-            response.get("values", []),
+            row.get("peakDemandTimes") or [],
+            row.get("values") or [],
         )
 
     def get_historical_consumption(
@@ -337,3 +397,49 @@ class Smartmeter:
             current = current + timedelta(days=1)
 
         return results
+
+
+def _extract_series(row: Dict[str, Any]) -> Dict[str, List[Optional[float]]]:
+    """Pull the known series out of one ConsumptionRecord row.
+
+    A series the portal has no data for comes back as a full-length list of
+    None rather than as an empty list or a missing key — those are dropped
+    here so callers can simply test for the key.
+    """
+    series: Dict[str, List[Optional[float]]] = {}
+    for name, field in CONSUMPTION_SERIES.items():
+        values = row.get(field)
+        if values is None and field in YEAR_FIELD_ALIASES:
+            values = row.get(YEAR_FIELD_ALIASES[field])
+        if not values or all(v is None for v in values):
+            continue
+        series[name] = values
+    return series
+
+
+def derive_series(
+    series: Dict[str, List[Optional[float]]]
+) -> Dict[str, List[Optional[float]]]:
+    """Add the series computed rather than read.
+
+    ``grid_leftover`` is ``metered - self_coverage``. The portal ships its
+    own ``gridUsageLeftoverValues``, and on every settled day measured the
+    two agree exactly.
+
+    It is still computed rather than read, because a day's figures arrive
+    over several hours and are briefly inconsistent while they do. On
+    2026-10-07, the day a second community membership started, the portal
+    reported a leftover of 7.839 kWh against a metered 28.355 in the morning
+    and a consistent 22.016 by the afternoon. The subtraction was right at
+    both times.
+    """
+    metered = series.get("metered")
+    self_coverage = series.get("self_coverage")
+    if not metered or not self_coverage:
+        return series
+    out = dict(series)
+    out["grid_leftover"] = [
+        None if (m is None or c is None) else m - c
+        for m, c in zip(metered, self_coverage)
+    ]
+    return out
